@@ -1,250 +1,237 @@
+import os
+import asyncio
 import logging
 import nest_asyncio
+
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
     MessageHandler, ContextTypes, filters
 )
-from ib_insync import IB, util, Stock
-import asyncio
+from ib_insync import IB, Stock
 
-# Prevent "event loop is already running" errors
 nest_asyncio.apply()
-
-# ✅ Logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ✅ Replace with your bot token and chat_id
 TELEGRAM_BOT_TOKEN = "7537301802:AAHNMUItC6y8PWEICOwt2JxlmvPVJVuOkbs"
-CHAT_ID = 6409841008  # 🔒 Your Telegram chat ID
+CHAT_ID = 6409841008
 
-# ✅ Default per-user state
-default_state = {"messages": [], "order": {}, "step": None, "action": None}
+def make_state():
+    return {"messages": [], "order": {}, "step": None, "action": None}
+
 user_data = {}
-
 
 class TradingBot:
     def __init__(self):
-        # Build the Telegram application
         self.app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-        # Initialize IBKR client
         self.ib = IB()
 
     def connect_ibkr(self):
-        try:
-            self.ib.connect("127.0.0.1", 7497, clientId=1)
-            logger.info("✅ Connected to IBKR")
-        except Exception as e:
-            logger.error(f"❌ IBKR connection failed: {e}")
-            raise
+        self.ib.connect("127.0.0.1", 7497, clientId=1)
+        logger.info("✅ Connected to IBKR")
 
     def disconnect_ibkr(self):
         self.ib.disconnect()
-        logger.info("🔌 Disconnected from IBKR")
+        logger.info("🔌 Disconnected IBKR")
 
-    # — Telegram handlers (all async) —
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        keyboard = [
+        kb = [
             [InlineKeyboardButton("📈 Buy", callback_data="buy"),
              InlineKeyboardButton("📉 Sell", callback_data="sell")],
             [InlineKeyboardButton("ℹ️ Help", callback_data="help")]
         ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
         msg = await update.message.reply_text(
-            "👋 Welcome to TradingBot! Choose an option:", reply_markup=reply_markup
+            "👋 Welcome! Choose an option:", 
+            reply_markup=InlineKeyboardMarkup(kb)
         )
-        chat_id = update.effective_chat.id
-        user_data[chat_id] = default_state.copy()
-        user_data[chat_id]["messages"] = [msg.message_id]
+        cid = update.effective_chat.id
+        user_data[cid] = make_state()
+        user_data[cid]["messages"] = [msg.message_id]
 
     async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
-            "ℹ️ Use /start to begin.\n"
-            "Choose Buy/Sell, enter Symbol, Amount (USD), Stop Loss, Take Profit.\n"
-            "Confirm before executing."
+            "ℹ️ /start → Buy/Sell → Symbol → Amount → SL% → TP% → Confirm"
         )
 
     async def handle_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        query = update.callback_query
-        await query.answer()
-        chat_id = query.message.chat_id
+        q = update.callback_query
+        cid = q.message.chat.id
 
-        if chat_id not in user_data:
-            user_data[chat_id] = default_state.copy()
-        user_data[chat_id]["messages"].append(query.message.message_id)
+        try:
+            await q.answer()
+        except:
+            pass
 
-        data = query.data
-        if data in ("buy", "sell"):
-            user_data[chat_id].update({
-                "action": data,
+        if cid not in user_data:
+            user_data[cid] = make_state()
+        user_data[cid]["messages"].append(q.message.message_id)
+
+        if q.data in ("buy", "sell"):
+            user_data[cid].update({
+                "action": q.data,
                 "order": {},
                 "step": "symbol"
             })
-            msg = await query.message.reply_text("📊 Enter the stock symbol (e.g., AAPL):")
-            user_data[chat_id]["messages"].append(msg.message_id)
+            m = await q.message.reply_text("📊 Enter symbol (e.g., AAPL):")
+            user_data[cid]["messages"].append(m.message_id)
 
-        elif data == "help":
-            await query.message.reply_text(
-                "💡 Send /start to start trading.\n"
-                "Use Buy/Sell buttons to initiate an order."
-            )
+        elif q.data == "help":
+            await q.message.reply_text("ℹ️ Press /start to begin trading.")
 
-        elif data == "yes":
-            await self.place_order(chat_id, context)
+        elif q.data == "yes":
+            if user_data[cid].get("step") == "confirm":
+                await self.place_order(cid, context)
+            else:
+                await q.message.reply_text("⚠️ Nothing to confirm.")
 
-        elif data == "no":
-            await query.message.reply_text("❌ Order cancelled.")
-            await self.clean_messages(chat_id, context)
+        elif q.data == "no":
+            await q.message.reply_text("❌ Order cancelled.")
+            await self.clean_messages(cid, context)
 
     async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        chat_id = update.effective_chat.id
-        if chat_id != CHAT_ID:
-            await update.message.reply_text("❌ Unauthorized access.")
-            return
+        cid = update.effective_chat.id
+        if cid != CHAT_ID:
+            return await update.message.reply_text("❌ Unauthorized.")
 
         text = update.message.text.strip().upper()
-        if chat_id not in user_data or not user_data[chat_id]["step"]:
-            await update.message.reply_text("⚠️ Please press /start first.")
-            return
+        if cid not in user_data or not user_data[cid]["step"]:
+            return await update.message.reply_text("⚠️ Use /start first.")
 
-        user_data[chat_id]["messages"].append(update.message.message_id)
-        order = user_data[chat_id]["order"]
-        step = user_data[chat_id]["step"]
+        user_data[cid]["messages"].append(update.message.message_id)
+        sd = user_data[cid]
+        o = sd["order"]
 
-        if step == "symbol":
-            order["symbol"] = text
-            user_data[chat_id]["step"] = "amount"
-            msg = await update.message.reply_text("💰 Enter amount in USD:")
-            user_data[chat_id]["messages"].append(msg.message_id)
+        if sd["step"] == "symbol":
+            o["symbol"] = text
+            sd["step"] = "amount"
+            m = await update.message.reply_text("💰 Enter amount in USD:")
+            sd["messages"].append(m.message_id)
 
-        elif step == "amount":
+        elif sd["step"] == "amount":
             try:
-                order["amount"] = float(text)
-                user_data[chat_id]["step"] = "sl"
-                msg = await update.message.reply_text("🔻 Enter Stop Loss % (e.g., 2 for 2%):")
-                user_data[chat_id]["messages"].append(msg.message_id)
+                o["amount"] = float(text)
+                sd["step"] = "sl"
+                m = await update.message.reply_text("🔻 Enter SL%:")
+                sd["messages"].append(m.message_id)
             except ValueError:
-                await update.message.reply_text("❌ Invalid amount. Please enter a number.")
+                await update.message.reply_text("❌ Invalid number.")
 
-        elif step == "sl":
+        elif sd["step"] == "sl":
             try:
-                order["sl"] = float(text)
-                user_data[chat_id]["step"] = "tp"
-                msg = await update.message.reply_text("🎯 Enter Take Profit % (e.g., 5 for 5%):")
-                user_data[chat_id]["messages"].append(msg.message_id)
+                o["sl"] = float(text)
+                sd["step"] = "tp"
+                m = await update.message.reply_text("🎯 Enter TP%:")
+                sd["messages"].append(m.message_id)
             except ValueError:
-                await update.message.reply_text("❌ Invalid SL. Please enter a number.")
+                await update.message.reply_text("❌ Invalid number.")
 
-        elif step == "tp":
+        elif sd["step"] == "tp":
             try:
-                order["tp"] = float(text)
-                user_data[chat_id]["step"] = "confirm"
-                await self.confirm_order(chat_id, context)
+                o["tp"] = float(text)
+                sd["step"] = "confirm"
+                await self.confirm_order(cid, context)
             except ValueError:
-                await update.message.reply_text("❌ Invalid TP. Please enter a number.")
+                await update.message.reply_text("❌ Invalid number.")
 
-    async def confirm_order(self, chat_id, context):
-        order = user_data[chat_id]["order"]
-        action = user_data[chat_id]["action"]
+    async def confirm_order(self, cid, context):
+        o = user_data[cid]["order"]
+        act = user_data[cid]["action"]
         text = (
-            f"📝 Confirm {action.upper()} Order:\n\n"
-            f"📊 Symbol: {order['symbol']}\n"
-            f"💰 Amount: ${order['amount']}\n"
-            f"🔻 Stop Loss: {order['sl']}%\n"
-            f"🎯 Take Profit: {order['tp']}%\n\n"
-            "✅ Proceed?"
+            f"📝 Confirm {act.upper()}:\n"
+            f"Symbol: {o['symbol']}\n"
+            f"Amt: ${o['amount']}\n"
+            f"SL: {o['sl']}%  TP: {o['tp']}%\n\n"
+            "Proceed?"
         )
-        keyboard = [[
+        kb = [[
             InlineKeyboardButton("✅ Yes", callback_data="yes"),
             InlineKeyboardButton("❌ No", callback_data="no")
         ]]
-        msg = await context.bot.send_message(
-            chat_id=chat_id, text=text, reply_markup=InlineKeyboardMarkup(keyboard)
+        m = await context.bot.send_message(
+            cid, text, reply_markup=InlineKeyboardMarkup(kb)
         )
-        user_data[chat_id]["messages"].append(msg.message_id)
+        user_data[cid]["messages"].append(m.message_id)
 
-    async def place_order(self, chat_id, context):
-        order = user_data[chat_id]["order"]
-        action = user_data[chat_id]["action"]
-        symbol = order["symbol"]
-        amount = order["amount"]
+    async def place_order(self, cid, context):
+        sd = user_data[cid]
+        o = sd["order"]
+        act, sym, amt = sd["action"], o["symbol"], o["amount"]
 
         try:
-            details = self.ib.reqContractDetails(Stock(symbol, "SMART", "USD"))
+            details = self.ib.reqContractDetails(Stock(sym, "SMART", "USD"))
+            if not details:
+                raise Exception("No contract details")
             contract = details[0].contract
             self.ib.qualifyContracts(contract)
 
-            ticker = self.ib.reqMktData(contract, '', False, False)
-            # give IB a moment to populate price
-            await asyncio.sleep(2)
-            price = ticker.marketPrice()
-            if price <= 0:
-                raise Exception("Market price not available")
-
-            quantity = round(amount / price, 2)
-            sl_pct = order['sl'] / 100
-            tp_pct = order['tp'] / 100
-
-            if action == 'buy':
-                stop_price = price * (1 - sl_pct)
-                take_profit_price = price * (1 + tp_pct)
+            test_price = os.getenv("TEST_PRICE")
+            if test_price:
+                price = float(test_price)
             else:
-                stop_price = price * (1 + sl_pct)
-                take_profit_price = price * (1 - tp_pct)
+                ticker = self.ib.reqMktData(contract, "", False, False)
+                price = None
+                for _ in range(10):
+                    await asyncio.sleep(0.5)
+                    price = ticker.last or ticker.ask or ticker.bid
+                    if price and price > 0:
+                        break
+                if not price or price <= 0:
+                    bars = self.ib.reqHistoricalData(
+                        contract, endDateTime="", durationStr="1 D",
+                        barSizeSetting="1 min", whatToShow="TRADES",
+                        useRTH=False, formatDate=1
+                    )
+                    if not bars:
+                        raise Exception("No market data")
+                    price = bars[-1].close
 
-            bracket = self.ib.bracketOrder(
-                action.upper(), quantity,
-                price,
-                take_profit_price,
-                stop_price
-            )
-            for o in bracket:
-                self.ib.placeOrder(contract, o)
+            qty = round(amt / price, 4)
+            if qty <= 0:
+                raise Exception(f"Bad qty: {qty}")
+
+            slp, tpp = o["sl"] / 100, o["tp"] / 100
+            if act == "buy":
+                stop_price = price * (1 - slp)
+                tp_price   = price * (1 + tpp)
+            else:
+                stop_price = price * (1 + slp)
+                tp_price   = price * (1 - tpp)
+
+            bracket = self.ib.bracketOrder(act.upper(), qty, price, tp_price, stop_price)
+            for ord_ in bracket:
+                self.ib.placeOrder(contract, ord_)
 
             await context.bot.send_message(
-                chat_id=chat_id,
-                text=(
-                    f"📤 Bracket order sent: {action.upper()} {quantity} {symbol} @ ${price:.2f}\n"
-                    f"🎯 TP @ ${take_profit_price:.2f}, 🔻 SL @ ${stop_price:.2f}"
-                )
+                cid,
+                f"📤 Bracket order sent: {act.upper()} {qty} {sym} @ ${price:.2f}\n"
+                f"🎯 TP @ ${tp_price:.2f}  🔻 SL @ ${stop_price:.2f}"
             )
-            logger.info(f"✅ Bracket order executed: {action.upper()} {quantity} {symbol}")
         except Exception as e:
-            await context.bot.send_message(chat_id=chat_id, text=f"❌ Order failed: {e}")
-            logger.error(f"❌ Order failed: {e}")
+            await context.bot.send_message(cid, f"❌ Order failed: {e}")
+            logger.error("Order failed", exc_info=True)
         finally:
-            await self.clean_messages(chat_id, context)
+            await self.clean_messages(cid, context)
 
-    async def clean_messages(self, chat_id, context):
-        try:
-            for msg_id in user_data[chat_id]["messages"]:
-                await context.bot.delete_message(chat_id=chat_id, message_id=msg_id)
-        except Exception as e:
-            logger.warning(f"⚠️ Message cleanup failed: {e}")
-        user_data[chat_id] = default_state.copy()
+    async def clean_messages(self, cid, context):
+        for mid in user_data[cid]["messages"]:
+            try:
+                await context.bot.delete_message(chat_id=cid, message_id=mid)
+            except:
+                pass
+        user_data[cid] = make_state()
 
-    # — synchronous run using run_polling() —
     def run(self):
-        # Connect to IBKR first
-        try:
-            self.connect_ibkr()
-        except Exception:
-            return
-
-        # Register handlers
+        self.connect_ibkr()
         self.app.add_handler(CommandHandler("start", self.start))
         self.app.add_handler(CommandHandler("help", self.help_command))
         self.app.add_handler(CallbackQueryHandler(self.handle_callback))
         self.app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_message))
 
-        logger.info("🚀 Bot is running!")
-        # This will block until you press Ctrl+C
+        logger.info("🚀 Bot running (polling)...")
         self.app.run_polling()
-        # Once polling stops, disconnect IBKR
         self.disconnect_ibkr()
 
 
 if __name__ == "__main__":
-    bot = TradingBot()
-    bot.run()
+    TradingBot().run()
