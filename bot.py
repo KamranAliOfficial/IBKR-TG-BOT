@@ -5,7 +5,9 @@ from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
     MessageHandler, ContextTypes, filters
 )
-from ib_insync import IB, MarketOrder, util
+import nest_asyncio
+nest_asyncio.apply()
+from ib_insync import IB, util
 
 # ✅ Logging
 logging.basicConfig(level=logging.INFO)
@@ -13,9 +15,10 @@ logger = logging.getLogger(__name__)
 
 # ✅ Replace with your bot token and chat_id
 TELEGRAM_BOT_TOKEN = "7537301802:AAHNMUItC6y8PWEICOwt2JxlmvPVJVuOkbs"
-CHAT_ID = 6251762088  # 🔒 Use your actual Telegram chat ID
+CHAT_ID = 6409841008  # 🔒 Use your actual Telegram chat ID
 
 # ✅ User state tracking
+default_state = {"messages": [], "order": {}, "step": None, "action": None}
 user_data = {}
 
 # ✅ TradingBot class
@@ -46,14 +49,9 @@ class TradingBot:
         message = await update.message.reply_text(
             "👋 Welcome to TradingBot! Choose an option:", reply_markup=reply_markup)
 
-        # Init user session
         chat_id = update.effective_chat.id
-        user_data[chat_id] = {
-            "messages": [message.message_id],
-            "order": {},
-            "step": None,
-            "action": None
-        }
+        user_data[chat_id] = default_state.copy()
+        user_data[chat_id]["messages"] = [message.message_id]
 
     async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
@@ -65,11 +63,11 @@ class TradingBot:
         chat_id = query.message.chat_id
 
         if chat_id not in user_data:
-            user_data[chat_id] = {"messages": [], "order": {}, "step": None, "action": None}
+            user_data[chat_id] = default_state.copy()
 
         user_data[chat_id]["messages"].append(query.message.message_id)
 
-        if query.data == "buy" or query.data == "sell":
+        if query.data in ("buy", "sell"):
             user_data[chat_id]["action"] = query.data
             user_data[chat_id]["order"] = {}
             user_data[chat_id]["step"] = "symbol"
@@ -78,8 +76,7 @@ class TradingBot:
 
         elif query.data == "help":
             await query.message.reply_text(
-                "💡 Send /start to start trading.\nUse Buy/Sell buttons to initiate an order."
-            )
+                "💡 Send /start to start trading.\nUse Buy/Sell buttons to initiate an order.")
 
         elif query.data == "yes":
             await self.place_order(chat_id, context)
@@ -116,7 +113,7 @@ class TradingBot:
                 user_data[chat_id]["step"] = "sl"
                 msg = await update.message.reply_text("🔻 Enter Stop Loss % (e.g., 2 for 2%):")
                 user_data[chat_id]["messages"].append(msg.message_id)
-            except:
+            except ValueError:
                 await update.message.reply_text("❌ Invalid amount. Please enter a number.")
 
         elif step == "sl":
@@ -125,7 +122,7 @@ class TradingBot:
                 user_data[chat_id]["step"] = "tp"
                 msg = await update.message.reply_text("🎯 Enter Take Profit % (e.g., 5 for 5%):")
                 user_data[chat_id]["messages"].append(msg.message_id)
-            except:
+            except ValueError:
                 await update.message.reply_text("❌ Invalid SL. Please enter a number.")
 
         elif step == "tp":
@@ -133,7 +130,7 @@ class TradingBot:
                 order["tp"] = float(text)
                 user_data[chat_id]["step"] = "confirm"
                 await self.confirm_order(chat_id, context)
-            except:
+            except ValueError:
                 await update.message.reply_text("❌ Invalid TP. Please enter a number.")
 
     async def confirm_order(self, chat_id, context):
@@ -162,23 +159,46 @@ class TradingBot:
         amount = order["amount"]
 
         try:
-            contract = self.ib.qualifyContracts(
-                self.ib.reqContractDetails(util.Stock(symbol, "SMART", "USD"))[0].contract
-            )[0]
+            details = self.ib.reqContractDetails(util.Stock(symbol, "SMART", "USD"))
+            contract = details[0].contract
+            self.ib.qualifyContracts(contract)
 
-            ticker = self.ib.reqMktData(contract, "", False, False)
+            ticker = self.ib.reqMktData(contract, '', False, False)
             await asyncio.sleep(2)
             price = ticker.marketPrice()
-
             if price <= 0:
                 raise Exception("Market price not available")
 
             quantity = round(amount / price, 2)
-            ib_order = MarketOrder(action.upper(), quantity)
-            trade = self.ib.placeOrder(contract, ib_order)
 
-            await context.bot.send_message(chat_id=chat_id, text=f"📤 Order sent: {action.upper()} {quantity} {symbol} at ${price:.2f}")
-            logger.info(f"✅ Executed: {action.upper()} {quantity} {symbol}")
+            # Calculate SL and TP prices
+            sl_pct = order['sl'] / 100
+            tp_pct = order['tp'] / 100
+            if action == 'buy':
+                stop_price = price * (1 - sl_pct)
+                take_profit_price = price * (1 + tp_pct)
+            else:  # sell
+                stop_price = price * (1 + sl_pct)
+                take_profit_price = price * (1 - tp_pct)
+
+            # Create bracket (OCO) order
+            bracket = self.ib.bracketOrder(
+                action.upper(), quantity,
+                price,
+                take_profit_price,
+                stop_price
+            )
+
+            # Place all orders in the bracket
+            for ord_ in bracket:
+                self.ib.placeOrder(contract, ord_)
+
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=(f"📤 Bracket order sent: {action.upper()} {quantity} {symbol} @ ${price:.2f}\n"
+                      f"🎯 TP @ ${take_profit_price:.2f}, 🔻 SL @ ${stop_price:.2f}")
+            )
+            logger.info(f"✅ Bracket order executed: {action.upper()} {quantity} {symbol}")
         except Exception as e:
             await context.bot.send_message(chat_id=chat_id, text=f"❌ Order failed: {e}")
             logger.error(f"❌ Order failed: {e}")
@@ -191,7 +211,7 @@ class TradingBot:
                 await context.bot.delete_message(chat_id=chat_id, message_id=msg_id)
         except Exception as e:
             logger.warning(f"⚠️ Message cleanup failed: {e}")
-        user_data[chat_id] = {"messages": [], "order": {}, "step": None, "action": None}
+        user_data[chat_id] = default_state.copy()
 
     async def run(self):
         try:
